@@ -7,15 +7,15 @@ $CrashMsg         = '[!] 内核崩溃，请重试（EXP 抢内核竞态可能会
 $PrebuiltNames    = @('exploit_static')
 $GhostlockDirName = 'Ghostlock-HonorPad9Pro-main'
 
-$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$ScriptDir = (Get-Location).Path
+if ($PSScriptRoot) { $ScriptDir = $PSScriptRoot }
 $logFile    = Join-Path $ScriptDir 'exp_output.log'
 $markerFile = Join-Path $ScriptDir 'exp_done.marker'
-# Ghostlock 源码就在本仓库根目录（exploit/ 是其子目录）；兜底指向脚本自身所在目录。
 $GhostlockFallback = $ScriptDir
 # =======================================
 
 # ---------- ADB 定位：优先项目自带 ADB，否则用 PATH 里的 adb ----------
-$adbLocal = Join-Path $ScriptDir 'adb-fastboot-tools\adb.exe'
+$adbLocal = Join-Path $ScriptDir 'tools\adb.exe'
 $adbPath  = $null
 if (Test-Path $adbLocal) {
     $adbPath = $adbLocal
@@ -31,6 +31,29 @@ else {
 }
 function adb { & $script:adbPath @args }
 
+# ---------- 本地 nc 定位：优先项目自带 nc/ncat ----------
+$localNcPath  = $null
+$localNcNames = @('nc.exe', 'ncat.exe')
+$ncSearchDirs = @(
+    (Join-Path $ScriptDir 'tools'),
+    (Join-Path $ScriptDir 'nc'),
+    $ScriptDir
+)
+foreach ($dir in $ncSearchDirs) {
+    foreach ($name in $localNcNames) {
+        $candidate = Join-Path $dir $name
+        if (Test-Path $candidate) {
+            $localNcPath = (Resolve-Path $candidate).Path
+            Write-Host "找到项目自带 nc: $localNcPath" -ForegroundColor DarkGray
+            break
+        }
+    }
+    if ($localNcPath) { break }
+}
+if (-not $localNcPath) {
+    Write-Host "未找到项目自带 nc, 将尝试 WSL / 系统 ncat / 内置 TCP" -ForegroundColor DarkGray
+}
+
 # ---------- 工具函数 ----------
 function ConvertTo-WslPath {
     param([string]$WinPath)
@@ -43,27 +66,13 @@ function ConvertTo-WslPath {
 
 function Find-GhostlockDir {
     param([string]$BaseDir, [string]$DirName, [string]$Fallback)
-
     $candidates = New-Object System.Collections.Generic.List[string]
-
-    # 1) 脚本同级
     $candidates.Add((Join-Path $BaseDir $DirName))
-
-    # 2) 脚本父级
     $parent = Split-Path $BaseDir -Parent -ErrorAction SilentlyContinue
-    if ($parent) {
-        $candidates.Add((Join-Path $parent $DirName))
-    }
-
-    # 3) 兜底路径
-    if ($Fallback) {
-        $candidates.Add($Fallback)
-    }
-
+    if ($parent) { $candidates.Add((Join-Path $parent $DirName)) }
+    if ($Fallback) { $candidates.Add($Fallback) }
     foreach ($c in $candidates) {
-        if ($c -and (Test-Path $c)) {
-            return (Resolve-Path $c).Path
-        }
+        if ($c -and (Test-Path $c)) { return (Resolve-Path $c).Path }
     }
     return $null
 }
@@ -75,6 +84,21 @@ function Test-WslReady {
         $text = (($out | Out-String) -replace "`0", '').Trim()
         return ($LASTEXITCODE -eq 0 -and $text -match '__WSL_OK__')
     } catch { return $false }
+}
+
+function Test-TcpPort {
+    param($TargetIp, $TargetPort, $TimeoutMs = 3000)
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $ar = $client.BeginConnect($TargetIp, $TargetPort, $null, $null)
+        if ($ar.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            $client.EndConnect($ar)
+            return $true
+        }
+        return $false
+    } catch { return $false }
+    finally { if ($client) { $client.Close() } }
 }
 
 # ---------- 1. 获取设备 IP ----------
@@ -155,6 +179,26 @@ if (-not $binWin) {
     exit 1
 }
 
+# ---------- 2.5 推送前确认已阅读 README ----------
+$readmePath = Join-Path $ScriptDir 'README.md'
+Write-Host "`n===== [确认] 运行前请先阅读 README =====" -ForegroundColor Yellow
+Write-Host "本工具会获取设备临时 root 权限并关闭 SELinux 与模块签名校验；" -ForegroundColor Yellow
+Write-Host "失败时可能导致平板重启（内核启用了 CONFIG_PANIC_ON_OOPS=y）。" -ForegroundColor Yellow
+Write-Host "请在确认设备版本精确匹配、并已备份重要数据后再继续。" -ForegroundColor Yellow
+if (Test-Path $readmePath) {
+    Write-Host "README 路径: $readmePath" -ForegroundColor DarkGray
+}
+else {
+    Write-Host "未找到 README.md，请确认你已了解本工具的风险。" -ForegroundColor Red
+}
+
+$answer = Read-Host "是否已阅读 README.md 并确认继续？(输入 Y 继续，其他任意键退出)"
+if ($answer -notmatch '^(y|yes)$') {
+    Write-Host "已取消。请先阅读 README.md 再运行本脚本。" -ForegroundColor Red
+    exit 1
+}
+Write-Host "已确认，继续推送。" -ForegroundColor Green
+
 # ---------- 3. 推送 ----------
 Write-Host "`n===== [2/5] 推送并赋权 =====" -ForegroundColor Cyan
 adb push $binWin /data/local/tmp/gl_sdy
@@ -178,7 +222,7 @@ try {
     `$fs = [System.IO.File]::Open(`$logFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
     `$sw = New-Object System.IO.StreamWriter(`$fs)
     `$sw.AutoFlush = `$true
-    adb shell "$runCmd" 2>&1 | ForEach-Object {
+    & '$adbPath' shell "$runCmd" 2>&1 | ForEach-Object {
         Write-Host `$_
         try { `$sw.WriteLine(`$_) } catch {}
         if (`$_.Contains('$Marker')) {
@@ -277,55 +321,100 @@ else {
     Write-Warning "等待 ${WaitSec}s 未检测到标记，仍尝试打开 nc 窗口"
 }
 
-# ---------- 6. WSL 连接设备 ----------
-Write-Host "`n===== [5/5] 从 WSL 连接 $($deviceIp):$NcPort =====" -ForegroundColor Cyan
+# ---------- 6. 连接设备（降级链：本地 nc > WSL > 系统 ncat/nc > 内置 TCP） ----------
+Write-Host "`n===== [5/5] 连接 $($deviceIp):$NcPort =====" -ForegroundColor Cyan
 
-# 6.1 预检
-Write-Host "WSL 连通性预检..." -ForegroundColor DarkGray
-$probeCmd = "nc -zv -w 3 $deviceIp $NcPort 2>&1"
-$probeOut = wsl bash -c "$probeCmd" 2>&1
-$probeStr = ($probeOut | Out-String).Trim()
-if ($probeStr) { Write-Host "  $probeStr" -ForegroundColor DarkGray }
-
-if ($probeStr -match 'succeeded|open') {
-    Write-Host "预检通过: $($deviceIp):$NcPort 可连" -ForegroundColor Green
+# 6.1 选择客户端
+$clientKind = 'ps'
+if ($localNcPath) {
+    $clientKind = 'local'
 }
-elseif ($probeStr -match 'command not found') {
-    Write-Warning "WSL 里没装 nc, 先执行: wsl bash -c 'sudo apt install -y netcat-openbsd'"
-}
-elseif ($probeStr -match 'refused') {
-    Write-Warning "端口拒绝连接: EXP 可能还没真正监听 $NcPort, 或已退出"
-}
-elseif ($probeStr -match 'timed out|unreachable') {
-    Write-Warning "连接超时: WSL 到 $deviceIp 网络不通 (检查 WSL2 NAT / 防火墙)"
+elseif ($wslReady) {
+    $clientKind = 'wsl'
 }
 else {
-    Write-Warning "预检未明确成功, 仍尝试打开 nc 窗口"
+    $sysNcat = Get-Command ncat -ErrorAction SilentlyContinue
+    if (-not $sysNcat) { $sysNcat = Get-Command nc -ErrorAction SilentlyContinue }
+    if ($sysNcat) {
+        $clientKind = 'ncat'
+        $ncatPath = $sysNcat.Source
+    }
+}
+Write-Host "连接方式: $clientKind" -ForegroundColor DarkGray
+
+# 6.2 预检（统一用 TcpClient, 不依赖 nc 参数差异）
+Write-Host "连通性预检..." -NoNewline
+$probeOk = Test-TcpPort -TargetIp $deviceIp -TargetPort $NcPort -TimeoutMs 3000
+if ($probeOk) {
+    Write-Host " 通过" -ForegroundColor Green
+    Write-Host "  $($deviceIp):$NcPort 可连" -ForegroundColor DarkGray
+} else {
+    Write-Host " 失败" -ForegroundColor Yellow
+    Write-Warning "预检失败: 端口未开放 / 网络不通, 仍尝试打开连接窗口 (EXP 可能还没真正监听, 或 WSL2 NAT 阻挡)"
 }
 
-# 6.2 生成临时 .sh, 由 WSL 直接执行, 绕开 Start-Process 引号问题
-$connectSh = Join-Path $env:TEMP 'gl_connect.sh'
-$shLines = @(
-    '#!/bin/bash'
-    "nc $deviceIp $NcPort"
-    'echo'
-    'echo "=== nc closed, dropping to bash ==="'
-    'exec bash'
-)
-$shContent = ($shLines -join "`n") + "`n"
-# 纯 ASCII + LF, 避免 BOM 和 CRLF 让 bash 报错
-[System.IO.File]::WriteAllText($connectSh, $shContent, [System.Text.Encoding]::ASCII)
+# 6.3 启动对应客户端
+if ($clientKind -eq 'local') {
+    Write-Host "打开本地 nc 窗口: $localNcPath" -ForegroundColor Cyan
+    Start-Process -FilePath $localNcPath -ArgumentList @($deviceIp, $NcPort) -WindowStyle Normal
+}
+elseif ($clientKind -eq 'wsl') {
+    $connectSh = Join-Path $env:TEMP 'gl_connect.sh'
+    $shLines = @(
+        '#!/bin/bash'
+        "nc $deviceIp $NcPort"
+        'echo'
+        'echo "=== nc closed, dropping to bash ==="'
+        'exec bash'
+    )
+    [System.IO.File]::WriteAllText($connectSh, (($shLines -join "`n") + "`n"), [System.Text.Encoding]::ASCII)
 
-# Windows 路径转 WSL 路径
-$drive = $connectSh.Substring(0,1).ToLower()
-$rest  = $connectSh.Substring(2).Replace('\','/')
-$wslSh = "/mnt/$drive$rest"
+    $drive = $connectSh.Substring(0,1).ToLower()
+    $rest  = $connectSh.Substring(2).Replace('\','/')
+    $wslSh = "/mnt/$drive$rest"
 
-$argStr = "bash $wslSh"
-if ($WslDistro) { $argStr = "-d $WslDistro " + $argStr }
-
-Write-Host "打开 WSL nc 窗口: $wslSh" -ForegroundColor Cyan
-Start-Process -FilePath 'wsl.exe' -ArgumentList $argStr -WindowStyle Normal
+    $argList = @()
+    if ($WslDistro) { $argList += @('-d', $WslDistro) }
+    $argList += @('bash', "`"$wslSh`"")
+    Write-Host "打开 WSL 窗口: $wslSh" -ForegroundColor Cyan
+    Start-Process -FilePath 'wsl.exe' -ArgumentList $argList -WindowStyle Normal
+}
+elseif ($clientKind -eq 'ncat') {
+    Write-Host "打开系统 ncat 窗口: $ncatPath" -ForegroundColor Cyan
+    Start-Process -FilePath $ncatPath -ArgumentList @($deviceIp, $NcPort) -WindowStyle Normal
+}
+else {
+    $tcpPs1 = Join-Path $env:TEMP 'gl_tcp_client.ps1'
+    $tcpBody = @'
+param([string]$DeviceIp, [int]$Port)
+$ErrorActionPreference = 'Continue'
+$client = $null
+try {
+    $client = New-Object System.Net.Sockets.TcpClient
+    $client.Connect($DeviceIp, $Port)
+    $stream = $client.GetStream()
+    $stdout = [Console]::OpenStandardOutput()
+    $stdin  = [Console]::OpenStandardInput()
+    Write-Host "已连接 $DeviceIp`:$Port (Ctrl+C 退出)" -ForegroundColor Green
+    $readTask  = $stream.CopyToAsync($stdout)
+    $writeTask = $stdin.CopyToAsync($stream)
+    [System.Threading.Tasks.Task]::WaitAny(@($readTask, $writeTask)) | Out-Null
+}
+catch {
+    Write-Host "连接/通信失败: $($_.Exception.Message)" -ForegroundColor Red
+}
+finally {
+    if ($client) { $client.Close() }
+}
+Write-Host ''
+Write-Host '=== 连接已断开, 按任意键关闭 ===' -ForegroundColor Yellow
+$null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+'@
+    Set-Content -Path $tcpPs1 -Value $tcpBody -Encoding UTF8
+    Write-Host "打开 PowerShell 内置 TCP 客户端: $tcpPs1" -ForegroundColor Cyan
+    $psArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$tcpPs1`"",'-DeviceIp',$deviceIp,'-Port',$NcPort)
+    Start-Process powershell -ArgumentList $psArgs -WindowStyle Normal
+}
 
 Write-Host "`n完成。" -ForegroundColor Green
-Write-Host "若 WSL 窗口显示 bash 提示符而非 nc 会话, 看上方预检结论定位原因。" -ForegroundColor Yellow
+Write-Host "连接窗口是独立进程, 主脚本退出后仍保留; 关闭它请手动操作。" -ForegroundColor Yellow
